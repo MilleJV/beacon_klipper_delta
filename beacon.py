@@ -1,9 +1,10 @@
 # Beacon eddy current scanner support
-#
+# Modified for Delta printer compatibility
 # Copyright (C) 2020-2023 Matt Baker <baker.matt.j@gmail.com>
 # Copyright (C) 2020-2023 Lasse Dalegaard <dalegaard@gmail.com>
 # Copyright (C) 2023 Beacon <beacon3d.com>
-#
+# Javier Miller
+# Integrated to latest Beacon release using https://github.com/Sab-tech-lab/Cartographer3d-FLsun-V400
 # This file may be distributed under the terms of the GNU GPLv3 license.
 import threading
 import multiprocessing
@@ -69,7 +70,7 @@ class BeaconProbe:
         self.cal_ceil = config.getfloat("cal_ceil", 5.0)
         self.cal_speed = config.getfloat("cal_speed", 1.0)
         self.cal_move_speed = config.getfloat("cal_move_speed", 10.0)
-
+        
         self.autocal_max_speed = config.getfloat("autocal_max_speed", 10)
         self.autocal_speed = config.getfloat("autocal_speed", 3)
         self.autocal_accel = config.getfloat("autocal_accel", 100)
@@ -85,7 +86,7 @@ class BeaconProbe:
         self.skip_firmware_version_check = config.getboolean(
             "skip_firmware_version_check", False
         )
-
+        
         # Load models
         self.model = None
         self.models = {}
@@ -171,7 +172,7 @@ class BeaconProbe:
         )
         if register_as_probe:
             printer.lookup_object("pins").register_chip("probe", self)
-
+            
         # Register event handlers
         printer.register_event_handler("klippy:connect", self._handle_connect)
         printer.register_event_handler("klippy:shutdown", self.force_stop_streaming)
@@ -533,7 +534,7 @@ class BeaconProbe:
         )
 
         return [pos[0], pos[1], pos[2] + target - dist]
-
+ 
     def _run_probe_contact(self, gcmd):
         self.toolhead.wait_moves()
         speed = gcmd.get_float(
@@ -657,9 +658,9 @@ class BeaconProbe:
 
             def cb(kin_pos):
                 return self._calibrate(gcmd, kin_pos, nozzle_z, forced_z)
-
+                
             manual_probe.ManualProbeHelper(self.printer, gcmd, cb)
-
+            
     def _calibrate(self, gcmd, kin_pos, cal_nozzle_z, forced_z, is_auto=False):
         if kin_pos is None:
             if forced_z:
@@ -670,13 +671,15 @@ class BeaconProbe:
         gcmd.respond_info("Beacon calibration starting")
         cal_floor = gcmd.get_float("FLOOR", self.cal_floor)
         cal_ceil = gcmd.get_float("CEIL", self.cal_ceil)
+        cal_min_z = kin_pos[2] - cal_nozzle_z + cal_floor
+        cal_max_z = kin_pos[2] - cal_nozzle_z + cal_ceil
         cal_speed = gcmd.get_float("DESCEND_SPEED", self.cal_speed)
         move_speed = gcmd.get_float("MOVE_SPEED", self.cal_move_speed)
         model_name = gcmd.get("MODEL_NAME", "default")
 
         toolhead = self.toolhead
         toolhead.wait_moves()
-
+        
         # Move coordinate system to nozzle location
         self.toolhead.get_last_move_time()
         curpos = toolhead.get_position()
@@ -684,20 +687,20 @@ class BeaconProbe:
         toolhead.set_position(curpos)
 
         # Move over to probe coordinate and pull out backlash
-        curpos[2] = cal_ceil + self.backlash_comp
+        
+        curpos = self.toolhead.get_position()
+        curpos[2] = cal_max_z + self.backlash_comp
         toolhead.manual_move(curpos, move_speed)  # Up
         curpos[0] -= self.x_offset
         curpos[1] -= self.y_offset
         toolhead.manual_move(curpos, move_speed)  # Over
-        curpos[2] = cal_ceil
+        curpos[2] = cal_max_z
         toolhead.manual_move(curpos, move_speed)  # Down
         toolhead.wait_moves()
 
         samples = []
-
         def cb(sample):
             samples.append(sample)
-
         # Descend while sampling
         toolhead.flush_step_generation()
         try:
@@ -706,7 +709,7 @@ class BeaconProbe:
             with self.streaming_session(cb):
                 self._sample_printtime_sync(50)
                 toolhead.dwell(0.250)
-                curpos[2] = cal_floor
+                curpos[2] = cal_min_z
                 toolhead.manual_move(curpos, cal_speed)
                 toolhead.flush_step_generation()
                 self._sample_printtime_sync(50)
@@ -714,7 +717,7 @@ class BeaconProbe:
             self._stop_streaming()
 
         # Fit the sampled data
-        z_offset = [s["pos"][2] for s in samples]
+        z_offset = [s["pos"][2] - cal_min_z + cal_floor for s in samples]
         freq = [s["freq"] for s in samples]
         temp = [s["temp"] for s in samples]
         inv_freq = [1 / f for f in freq]
@@ -726,6 +729,8 @@ class BeaconProbe:
         self.models[self.model.name] = self.model
         self.model.save(self, not is_auto)
         self._apply_threshold()
+        pos[2] = cal_floor
+        self.toolhead.set_position(pos)
 
         # Dump calibration curve
         fn = "/tmp/beacon-calibrate-" + time.strftime("%Y%m%d_%H%M%S") + ".csv"
@@ -737,7 +742,7 @@ class BeaconProbe:
         gcmd.respond_info(
             "Beacon calibrated at %.3f,%.3f from "
             "%.3f to %.3f, speed %.2f mm/s, temp %.2fC"
-            % (curpos[0], curpos[1], cal_floor, cal_ceil, cal_speed, temp_median)
+            % (curpos[0], curpos[1],cal_min_z, cal_max_z, cal_speed, temp_median)
         )
 
     # Internal
@@ -764,7 +769,7 @@ class BeaconProbe:
         if not self.mesh_helper:
             return False
         return self.mesh_helper._is_faulty_coordinate(x, y, add_offsets)
-
+        
     def _handle_beacon_status(self, params):
         if self.mcu_temp is not None:
             self.last_mcu_temp = self.mcu_temp.compensate(
@@ -829,7 +834,7 @@ class BeaconProbe:
         self._stream_en += 1
         self._data_filter.reset()
         self._stream_flush()
-
+        
     def _stop_streaming(self):
         self._stream_en -= 1
         if self._stream_en == 0:
@@ -882,7 +887,7 @@ class BeaconProbe:
 
     def streaming_session(self, callback, completion_callback=None, latency=None):
         return StreamingHelper(self, callback, completion_callback, latency)
-
+        
     def _stream_flush_message(self, msg):
         last = None
         for sample in msg:
@@ -969,7 +974,7 @@ class BeaconProbe:
     def _handle_beacon_data(self, params):
         if self.trapq is None:
             return
-
+            
         buf = bytearray(params["data"])
         sample_count = params["samples"]
         start_clock = params["start_clock"]
@@ -1025,14 +1030,14 @@ class BeaconProbe:
             return samples[0]
         else:
             return samples
-
+            
     def _sample(self, skip, count):
         samples = self._sample_printtime_sync(skip, count)
         return (median([s["dist"] for s in samples]), samples)
 
     def _sample_async(self, count=1):
         samples = []
-
+        
         def cb(sample):
             samples.append(sample)
             if len(samples) >= count:
@@ -1126,7 +1131,7 @@ class BeaconProbe:
     # GCode command handlers
 
     cmd_PROBE_help = "Probe Z-height at current XY position"
-
+    
     def cmd_PROBE(self, gcmd):
         self.last_probe_result = "failed"
         pos = self.run_probe(gcmd)
@@ -1137,12 +1142,12 @@ class BeaconProbe:
         self.last_probe_result = "ok"
 
     cmd_BEACON_CALIBRATE_help = "Calibrate beacon response curve"
-
+    
     def cmd_BEACON_CALIBRATE(self, gcmd):
         self._start_calibration(gcmd)
 
     cmd_BEACON_ESTIMATE_BACKLASH_help = "Estimate Z axis backlash"
-
+    
     def cmd_BEACON_ESTIMATE_BACKLASH(self, gcmd):
         # Get to correct Z height
         overrun = gcmd.get_float("OVERRUN", 1.0)
@@ -1197,7 +1202,7 @@ class BeaconProbe:
         )
 
     cmd_BEACON_QUERY_help = "Take a sample from the sensor"
-
+    
     def cmd_BEACON_QUERY(self, gcmd):
         sample = self._sample_async()
         last_value = sample["freq"]
@@ -1223,7 +1228,7 @@ class BeaconProbe:
             )
 
     cmd_BEACON_STREAM_help = "Enable Beacon Streaming"
-
+    
     def cmd_BEACON_STREAM(self, gcmd):
         if self._log_stream is not None:
             self._log_stream.stop()
@@ -1234,10 +1239,10 @@ class BeaconProbe:
             completion_cb = None
             fn = gcmd.get("FILENAME")
             f = open(fn, "w")
-
+            
             def close_file():
                 f.close()
-
+                
             completion_cb = close_file
             f.write("time,data,data_smooth,freq,dist,temp,pos_x,pos_y,pos_z\n")
 
@@ -1260,7 +1265,7 @@ class BeaconProbe:
             gcmd.respond_info("Beacon Streaming enabled")
 
     cmd_PROBE_ACCURACY_help = "Probe Z-height accuracy at current XY position"
-
+    
     def cmd_PROBE_ACCURACY(self, gcmd):
         speed = gcmd.get_float("PROBE_SPEED", self.speed, above=0.0)
         lift_speed = self.get_lift_speed(gcmd)
@@ -1314,7 +1319,7 @@ class BeaconProbe:
         )
 
     cmd_Z_OFFSET_APPLY_PROBE_help = "Adjust the probe's z_offset"
-
+    
     def cmd_Z_OFFSET_APPLY_PROBE(self, gcmd):
         gcode_move = self.printer.lookup_object("gcode_move")
         offset = gcode_move.get_status()["homing_origin"].z
@@ -1343,7 +1348,7 @@ class BeaconProbe:
             "printer config file and restart the printer." % (self.model.offset,)
         )
         self.model.offset = old_offset
-
+        
     cmd_BEACON_POKE_help = "Poke the bed"
 
     def cmd_BEACON_POKE(self, gcmd):
@@ -1685,8 +1690,8 @@ class BeaconModel:
         if self.temp is not None and self.beacon.model_temp is not None:
             freq = self.beacon.model_temp.compensate(freq, self.temp, temp)
         return freq
-
-
+        
+        
 class BeaconMCUTempHelper:
     def __init__(self, temp_room, temp_hot, ref_room, ref_hot, adc_room, adc_hot):
         self.temp_room = temp_room
@@ -1897,7 +1902,7 @@ class ModelManager:
         )
 
     cmd_BEACON_MODEL_SELECT_help = "Load named beacon model"
-
+    
     def cmd_BEACON_MODEL_SELECT(self, gcmd):
         name = gcmd.get("NAME")
         model = self.beacon.models.get(name, None)
@@ -1907,7 +1912,7 @@ class ModelManager:
         gcmd.respond_info("Selected Beacon model '%s'" % (name,))
 
     cmd_BEACON_MODEL_SAVE_help = "Save current beacon model"
-
+    
     def cmd_BEACON_MODEL_SAVE(self, gcmd):
         model = self.beacon.model
         if model is None:
@@ -1922,7 +1927,7 @@ class ModelManager:
             self.beacon.models[name] = model
 
     cmd_BEACON_MODEL_REMOVE_help = "Remove saved beacon model"
-
+    
     def cmd_BEACON_MODEL_REMOVE(self, gcmd):
         name = gcmd.get("NAME")
         model = self.beacon.models.get(name, None)
@@ -1941,7 +1946,7 @@ class ModelManager:
             self.beacon.model = None
 
     cmd_BEACON_MODEL_LIST_help = "Remove saved beacon model"
-
+    
     def cmd_BEACON_MODEL_LIST(self, gcmd):
         if not self.beacon.models:
             gcmd.respond_info("No Beacon models loaded")
@@ -2117,7 +2122,7 @@ class BeaconEndstopShared:
         for stepper in kin.get_steppers():
             if stepper.is_active_axis("z"):
                 self.add_stepper(stepper)
-
+                
     def add_stepper(self, stepper):
         trsyncs = {trsync.get_mcu(): trsync for trsync in self._trsyncs}
         stepper_mcu = stepper.get_mcu()
@@ -2136,7 +2141,7 @@ class BeaconEndstopShared:
                         raise self.beacon.printer.config_error(
                             "Multi-mcu homing not supported on multi-mcu shared axis"
                         )
-
+                                               
     def get_steppers(self):
         return [s for trsync in self._trsyncs for s in trsync.get_steppers()]
 
@@ -2226,7 +2231,7 @@ class BeaconEndstopWrapper:
         self.is_homing = True
         self.beacon._apply_threshold()
         self.beacon._sample_async()
-
+        
         self._shared.trsync_start(print_time)
 
         etrsync = self._shared._trsync
@@ -2576,34 +2581,49 @@ class BeaconMeshHelper:
     def create(cls, beacon, config):
         if config.has_section("bed_mesh"):
             mesh_config = config.getsection("bed_mesh")
+            printer_config = config.getsection("printer")         
             if mesh_config.get("mesh_radius", None) is not None:
-                return None  # Use normal bed meshing for round beds
-            return BeaconMeshHelper(beacon, config, mesh_config)
+                return BeaconMeshHelper(beacon, config, mesh_config, printer_config)
         else:
             return None
 
-    def __init__(self, beacon, config, mesh_config):
+    def __init__(self, beacon, config, mesh_config, printer_config):
         self.beacon = beacon
         self.scipy = None
         self.mesh_config = mesh_config
+        self.printer_config = printer_config
         self.bm = self.beacon.printer.load_object(mesh_config, "bed_mesh")
 
         self.speed = mesh_config.getfloat("speed", 50.0, above=0.0, note_valid=False)
-        self.def_min_x, self.def_min_y = mesh_config.getfloatlist(
-            "mesh_min", count=2, note_valid=False
-        )
-        self.def_max_x, self.def_max_y = mesh_config.getfloatlist(
-            "mesh_max", count=2, note_valid=False
-        )
-
-        if self.def_min_x > self.def_max_x:
-            self.def_min_x, self.def_max_x = self.def_max_x, self.def_min_x
-        if self.def_min_y > self.def_max_y:
-            self.def_min_y, self.def_max_y = self.def_max_y, self.def_min_y
-
-        self.def_res_x, self.def_res_y = mesh_config.getintlist(
-            "probe_count", count=2, note_valid=False
-        )
+        self.radius = mesh_config.getfloat("mesh_radius", None, above=0.0)
+        self.print_radius = printer_config.getfloat("print_radius", None, above=0.0)
+        
+        if self.radius is not None:
+            self.origin = mesh_config.getfloatlist("mesh_origin", (0.0, 0.0), count=2)
+            self.def_res_x = self.def_res_y = mesh_config.getint("round_probe_count", 5, minval=3)
+            # round beds must have an odd number of points along each axis
+            if not self.def_res_x & 1:
+                raise config.error("bed_mesh: probe_count must be odd for round beds")
+            # radius may have precision to .1mm
+            self.radius = math.floor(self.radius * 10) / 10
+            self.def_min_x = self.def_min_y = -self.radius
+            self.def_max_x = self.def_max_y = self.radius
+            self.rri = int((self.def_res_x * self.def_res_y)/2)
+        else:
+            self.def_min_x, self.def_min_y = mesh_config.getfloatlist(
+                "mesh_min", count=2, note_valid=False
+            )
+            self.def_max_x, self.def_max_y = mesh_config.getfloatlist(
+                "mesh_max", count=2, note_valid=False
+            )
+            if self.def_min_x > self.def_max_x:
+                self.def_min_x, self.def_max_x = self.def_max_x, self.def_min_x
+            if self.def_min_y > self.def_max_y:
+                self.def_min_y, self.def_max_y = self.def_max_y, self.def_min_y
+                
+            self.def_res_x, self.def_res_y = mesh_config.getintlist(
+                "probe_count", count=2, note_valid=False
+            )
         self.rri = mesh_config.getint(
             "relative_reference_index", None, note_valid=False
         )
@@ -2620,9 +2640,8 @@ class BeaconMeshHelper:
         self.cluster_size = config.getfloat("mesh_cluster_size", 1, minval=0)
         self.runs = config.getint("mesh_runs", 1, minval=1)
         self.adaptive_margin = mesh_config.getfloat(
-            "adaptive_margin", 0, note_valid=False
+            "adaptive_margin", 0, note_valid=False 
         )
-
         contact_def_min = config.getfloatlist(
             "contact_mesh_min",
             default=None,
@@ -2633,7 +2652,7 @@ class BeaconMeshHelper:
             default=None,
             count=2,
         )
-
+            
         xo = self.beacon.x_offset
         yo = self.beacon.y_offset
 
@@ -2644,54 +2663,55 @@ class BeaconMeshHelper:
                 max(self.def_min_y - yo, self.def_min_y),
             )
 
-        def_contact_max = contact_def_max
-        if contact_def_max is None:
-            def_contact_max = (
-                min(self.def_max_x - xo, self.def_max_x),
-                min(self.def_max_y - yo, self.def_max_y),
+
+            def_contact_max = contact_def_max
+            if contact_def_max is None:
+                def_contact_max = (
+                    min(self.def_max_x - xo, self.def_max_x),
+                    min(self.def_max_y - yo, self.def_max_y),
+                )
+
+            min_x = def_contact_min[0]
+            max_x = def_contact_max[0]
+            min_y = def_contact_min[1]
+            max_y = def_contact_max[1]
+            self.def_contact_min = (min(min_x, max_x), min(min_y, max_y))
+            self.def_contact_max = (max(min_x, max_x), max(min_y, max_y))
+
+            if self.zero_ref_pos is not None and self.rri is not None:
+                logging.info(
+                    "beacon: both 'zero_reference_position' and "
+                    "'relative_reference_index' options are specified. The"
+                    " former will be used"
+                )
+
+            self.faulty_regions = []
+            for i in list(range(1, 100, 1)):
+                start = mesh_config.getfloatlist(
+                    "faulty_region_%d_min" % (i,), None, count=2
+                )
+                if start is None:
+                    break
+                end = mesh_config.getfloatlist("faulty_region_%d_max" % (i,), count=2)
+                x_min = min(start[0], end[0])
+                x_max = max(start[0], end[0])
+                y_min = min(start[1], end[1])
+                y_max = max(start[1], end[1])
+                self.faulty_regions.append(Region(x_min, x_max, y_min, y_max))
+            
+            self.exclude_object = None
+            beacon.printer.register_event_handler("klippy:connect", self._handle_connect)
+        
+            self.gcode = beacon.gcode
+            self.prev_gcmd = self.gcode.register_command("BED_MESH_CALIBRATE", None)
+            self.gcode.register_command(
+                "BED_MESH_CALIBRATE",
+                self.cmd_BED_MESH_CALIBRATE,
+                desc=self.cmd_BED_MESH_CALIBRATE_help,
             )
-
-        min_x = def_contact_min[0]
-        max_x = def_contact_max[0]
-        min_y = def_contact_min[1]
-        max_y = def_contact_max[1]
-        self.def_contact_min = (min(min_x, max_x), min(min_y, max_y))
-        self.def_contact_max = (max(min_x, max_x), max(min_y, max_y))
-
-        if self.zero_ref_pos is not None and self.rri is not None:
-            logging.info(
-                "beacon: both 'zero_reference_position' and "
-                "'relative_reference_index' options are specified. The"
-                " former will be used"
-            )
-
-        self.faulty_regions = []
-        for i in list(range(1, 100, 1)):
-            start = mesh_config.getfloatlist(
-                "faulty_region_%d_min" % (i,), None, count=2
-            )
-            if start is None:
-                break
-            end = mesh_config.getfloatlist("faulty_region_%d_max" % (i,), count=2)
-            x_min = min(start[0], end[0])
-            x_max = max(start[0], end[0])
-            y_min = min(start[1], end[1])
-            y_max = max(start[1], end[1])
-            self.faulty_regions.append(Region(x_min, x_max, y_min, y_max))
-
-        self.exclude_object = None
-        beacon.printer.register_event_handler("klippy:connect", self._handle_connect)
-
-        self.gcode = beacon.gcode
-        self.prev_gcmd = self.gcode.register_command("BED_MESH_CALIBRATE", None)
-        self.gcode.register_command(
-            "BED_MESH_CALIBRATE",
-            self.cmd_BED_MESH_CALIBRATE,
-            desc=self.cmd_BED_MESH_CALIBRATE_help,
-        )
 
     cmd_BED_MESH_CALIBRATE_help = "Perform Mesh Bed Leveling"
-
+    
     def cmd_BED_MESH_CALIBRATE(self, gcmd):
         method = gcmd.get("METHOD", "beacon").lower()
         probe_method = gcmd.get(
@@ -2732,7 +2752,7 @@ class BeaconMeshHelper:
 
     def _handle_connect(self):
         self.exclude_object = self.beacon.printer.lookup_object("exclude_object", None)
-
+        
         if self.overscan < 0:
             # Auto determine a safe overscan amount
             toolhead = self.beacon.printer.lookup_object("toolhead")
@@ -2793,12 +2813,26 @@ class BeaconMeshHelper:
         for i in range(0, settings["count"]):
             pos_p = begin_p + step * i
             even = i % 2 == 0  # If even we are going 'right', else 'left'
+            logging.info("Checking radius is %.3f points (%.3f,%.3f) and (%.3f,%.3f) " % (self.radius, begin_a, pos_p, end_a, pos_p))
+            if self.radius is not None:
+                if abs(pos_p) > self.print_radius:
+                    continue
+                dist_x = (self.radius**2-(pos_p)**2)
+                dist_x = math.sqrt(dist_x)
+                begin_a = -dist_x
+                end_a = dist_x
+                pos_p = pos_p
+            begin_a -= xo
+            end_a -= xo
+            pos_p -= yo
+            logging.info("Checking points (%.3f,%.3f) and (%.3f,%.3f) " % (begin_a, pos_p, end_a, pos_p))
+
             pa = (begin_a, pos_p) if even else (end_a, pos_p)
             pb = (end_a, pos_p) if even else (begin_a, pos_p)
-
+            
             line = (pa, pb)
 
-            if len(points) > 0 and corner_radius > 0:
+            if len(points) > 0 and corner_radius > 0 and self.radius is None:
                 # We need to insert an overscan corner. Basically we insert
                 # a rounded rectangle to smooth out the transition and retain
                 # as much speed as we can.
@@ -2835,7 +2869,7 @@ class BeaconMeshHelper:
             for i in range(len(points)):
                 (x, y) = points[i]
                 points[i] = (y, x)
-
+                
         return points
 
     def calibrate(self, gcmd):
@@ -2876,7 +2910,7 @@ class BeaconMeshHelper:
                 max(self.max_y, self.def_min_y),
                 min(self.min_y, self.def_max_y),
             )
-
+            
         # If the user gave RRI _on gcode_ then use it, else use zero_ref_pos
         # if we have it, and finally use config RRI if we have it.
         rri = gcmd.get_int("RELATIVE_REFERENCE_INDEX", None)
@@ -2900,7 +2934,7 @@ class BeaconMeshHelper:
                 gcmd.respond_info(
                     "Requested adaptive mesh, but [exclude_object] is not enabled. Ignoring."
                 )
-
+                
         self.step_x = (self.max_x - self.min_x) / (self.res_x - 1)
         self.step_y = (self.max_y - self.min_y) / (self.res_y - 1)
 
@@ -2923,7 +2957,7 @@ class BeaconMeshHelper:
 
             self.beacon._sample_printtime_sync(5)
             clusters = self._sample_mesh(gcmd, path, speed, runs)
-
+            
             if self.zero_ref_mode and self.zero_ref_mode[0] == "pos":
                 # If we didn't collect anything, hop over to the zero point
                 # and sample. Otherwise, grab the median of what we collected.
@@ -2931,13 +2965,13 @@ class BeaconMeshHelper:
                     self._collect_zero_ref(speed, self.zero_ref_mode[1])
                 else:
                     self.zero_ref_val = median(self.zero_ref_bin)
-
+                    
         finally:
             self.beacon._stop_streaming()
 
         matrix = self._process_clusters(clusters, gcmd)
         self._apply_mesh(matrix, gcmd)
-
+        
     def _shrink_to_excluded_objects(self, gcmd, margin):
         bound_min_x, bound_max_x = None, None
         bound_min_y, bound_max_y = None, None
@@ -2993,7 +3027,7 @@ class BeaconMeshHelper:
                 self.toolhead.manual_move([x, y, None], speed)
         self.toolhead.dwell(0.251)
         self.toolhead.wait_moves()
-
+        
     def _collect_zero_ref(self, speed, coord):
         xo, yo = self.beacon.x_offset, self.beacon.y_offset
         (x, y) = coord
@@ -3002,8 +3036,13 @@ class BeaconMeshHelper:
         self.zero_ref_val = dist
 
     def _is_valid_position(self, x, y):
+        if self.radius is not None:
+            return self._is_in_cicrle(x, y)
         return self.min_x <= x <= self.max_x and self.min_y <= y <= self.min_y
-
+  
+    def _is_in_cicrle(self, x, y):
+        return (x)**2 + (y)**2 <= self.radius**2
+        
     def _is_faulty_coordinate(self, x, y, add_offsets=False):
         if add_offsets:
             xo, yo = self.beacon.x_offset, self.beacon.y_offset
@@ -3038,7 +3077,7 @@ class BeaconMeshHelper:
                 if self._is_valid_position(x, y):
                     invalid_samples[0] += 1
                 return
-
+                
             # Calculate coordinate of the cluster we are in
             xi = int(round((x - min_x) / self.step_x))
             yi = int(round((y - min_y) / self.step_y))
@@ -3054,7 +3093,7 @@ class BeaconMeshHelper:
                 dist = math.sqrt(dx * dx + dy * dy)
                 if dist > cs:
                     return
-
+                    
             # If we are looking for a zero reference, check if we
             # are close enough and if so, add to the bin.
             if zcs > 0:
@@ -3063,7 +3102,7 @@ class BeaconMeshHelper:
                 dist = math.sqrt(dx * dx + dy * dy)
                 if dist <= zcs:
                     self.zero_ref_bin.append(d)
-
+                    
             k = (xi, yi)
 
             if k not in clusters:
@@ -3083,7 +3122,7 @@ class BeaconMeshHelper:
         gcmd.respond_info("Samples binned in %d clusters" % (len(clusters),))
 
         return clusters
-
+        
     def _process_clusters(self, raw_clusters, gcmd):
         parent_conn, child_conn = multiprocessing.Pipe()
         dump_file = gcmd.get("FILENAME", None)
@@ -3244,7 +3283,7 @@ class BeaconMeshHelper:
         if z_offset is not None:
             matrix = matrix - z_offset
         return matrix.tolist()
-
+        
     def _apply_mesh(self, matrix, gcmd):
         params = self.bm.bmc.mesh_config.copy()
         params["min_x"] = self.min_x
@@ -3253,11 +3292,15 @@ class BeaconMeshHelper:
         params["max_y"] = self.max_y
         params["x_count"] = self.res_x
         params["y_count"] = self.res_y
-        try:
-            mesh = bed_mesh.ZMesh(params)
-        except TypeError:
+        if self.radius is not None:
+            params["mesh_radius"] = self.radius
+            params["round_probe_count"] = self.def_res_x
+       
+       
             mesh = bed_mesh.ZMesh(params, self.profile_name)
         try:
+            self.gcode.respond_info("mesh.mesh_x_count %s" % mesh.mesh_x_count)
+            self.gcode.respond_info("mesh.mesh_y_count %s" % mesh.mesh_y_count)
             mesh.build_mesh(matrix)
         except bed_mesh.BedMeshError as e:
             raise self.gcode.error(str(e))
