@@ -1,9 +1,11 @@
 # Beacon eddy current scanner support
+# Modified for Delta printer compatibility
 #
 # Copyright (C) 2020-2023 Matt Baker <baker.matt.j@gmail.com>
 # Copyright (C) 2020-2023 Lasse Dalegaard <dalegaard@gmail.com>
 # Copyright (C) 2023 Beacon <beacon3d.com>
-#
+# Javier Miller
+# Integrated to latest Beacon release using https://github.com/Sab-tech-lab/Cartographer3d-FLsun-V400
 # This file may be distributed under the terms of the GNU GPLv3 license.
 import threading
 import multiprocessing
