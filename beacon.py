@@ -1,10 +1,9 @@
 # Beacon eddy current scanner support
-# Modified for Delta printer compatibility
+#
 # Copyright (C) 2020-2023 Matt Baker <baker.matt.j@gmail.com>
 # Copyright (C) 2020-2023 Lasse Dalegaard <dalegaard@gmail.com>
 # Copyright (C) 2023 Beacon <beacon3d.com>
-# Javier Miller
-# Integrated to latest Beacon release using https://github.com/Sab-tech-lab/Cartographer3d-FLsun-V400
+#
 # This file may be distributed under the terms of the GNU GPLv3 license.
 import threading
 import multiprocessing
@@ -2801,35 +2800,55 @@ class BeaconMeshHelper:
                 "swap_coord": True,
             },
         }[self.dir]
-
-        # We build the path in "normalized" coordinates and then simply
-        # swap x and y at the end if we need to
+        
+        points = []
         begin_a, end_a = settings["range_aligned"]
         begin_p, end_p = settings["range_perpendicular"]
         swap_coord = settings["swap_coord"]
-        step = (end_p - begin_p) / (float(settings["count"] - 1))
-        points = []
+        count = settings["count"]
+        
+        if count < 1:
+            logging.error("Mesh count is less than 1, cannot generate lines.")
+            return []
+        # We build the path in "normalized" coordinates and then simply
+        # swap x and y at the end if we need to
+        step =  0 if count == 1 else (end_p - begin_p) / (float(settings["count"] - 1))
         corner_radius = min(step / 2, self.overscan)
+        # Define a small tolerance for floating point errors (epsilon)
+        epsilon = 1e-9 
+        
         for i in range(0, settings["count"]):
             pos_p = begin_p + step * i
             even = i % 2 == 0  # If even we are going 'right', else 'left'
+            begin_a, end_a = settings["range_aligned"] # Default aligned axis bounds (full bed length if no radius constraint)
             logging.info("Checking radius is %.3f points (%.3f,%.3f) and (%.3f,%.3f) " % (self.radius, begin_a, pos_p, end_a, pos_p))
             if self.radius is not None:
-                if abs(pos_p) > self.print_radius:
+                if abs(pos_p) > self.print_radius + epsilon:
                     continue
-                dist_x = (self.radius**2-(pos_p)**2)
-                dist_x = math.sqrt(dist_x)
-                begin_a = -dist_x
-                end_a = dist_x
+                 # Calculate the squared distance component.
+                dist_squared = (self.radius**2 - (pos_p)**2)
+                # Use max(0, ...) to ensure the value is never negative due to 
+                # floating point errors or minor inconsistencies in the radius values.
+                dist_safe = math.sqrt(max(0, dist_squared))
+                begin_a = -dist_safe
+                end_a = dist_safe
                 pos_p = pos_p
             begin_a -= xo
             end_a -= xo
-            pos_p -= yo
+            pos_p -= yo               
             logging.info("Checking points (%.3f,%.3f) and (%.3f,%.3f) " % (begin_a, pos_p, end_a, pos_p))
-
+            
+            #if not swap_coord:
+                # X-direction scan: (X, Y) -> (A-axis, P-axis)
+                #pa = (begin_a, pos_p) if even else (end_a, pos_p)
+                #pb = (end_a, pos_p) if even else (begin_a, pos_p)
+            #else:
+                # Y-direction scan: (X, Y) -> (P-axis, A-axis) -> (pos_p, begin_a/end_a) 
+                # Note: In Y scan mode, pos_p is the X coord, begin_a/end_a are Y bounds.
+                #pa = (pos_p, begin_a) if even else (pos_p, end_a)
+                #pb = (pos_p, end_a) if even else (pos_p, begin_a)
             pa = (begin_a, pos_p) if even else (end_a, pos_p)
             pb = (end_a, pos_p) if even else (begin_a, pos_p)
-            
             line = (pa, pb)
 
             if len(points) > 0 and corner_radius > 0 and self.radius is None:
@@ -3907,4 +3926,4 @@ def load_config_prefix(config):
         beacon._register_model(name, model)
         return model
     else:
-        raise config.error("Unknown beacon config directive '%s'" % (secname,))
+        raise config.error("Unknown beacon config directive '%s'" % (secname,))       
