@@ -961,7 +961,8 @@ class BeaconProbe:
 
         except OSError as e:
             gcmd.respond_info(f"Warning: Could not write poke data to {filename}: {e}")
-
+            
+    cmd_BEACON_AUTO_CALIBRATE_help = "Automatically calibrates the Beacon probe"
     def cmd_BEACON_AUTO_CALIBRATE(self, gcmd):
         speed = gcmd.get_float("SPEED", self.autocal_speed, above=0, maxval=self.autocal_max_speed)
         desired_accel = gcmd.get_float("ACCEL", self.autocal_accel, minval=1)
