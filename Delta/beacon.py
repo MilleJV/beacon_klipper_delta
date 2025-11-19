@@ -872,9 +872,20 @@ class BeaconProbe:
         speed = gcmd.get_float("SPEED", self.POKE_DEFAULT_SPEED, maxval=self.autocal_max_speed)
 
         pos = self.toolhead.get_position()
+        
+        # --- SAFETY: Radius Check (V7) ---
+        # Prevents MCU shutdown if user tries to poke outside physical reach
+        if self.is_delta and self.print_radius:
+            dist_sq = pos[0]**2 + pos[1]**2
+            # Add a small safety margin (e.g. 1mm inside max radius)
+            if dist_sq > self.print_radius**2:
+                 raise gcmd.error(f"Unsafe Poke: Position ({pos[0]:.2f}, {pos[1]:.2f}) is outside print radius ({self.print_radius})")
+        # ---------------------------------
+
         gcmd.respond_info(
             f"Poke test at ({pos[0]:.3f},{pos[1]:.3f}), from {top:.3f} to {bottom:.3f}, at {speed:.3f} mm/s"
         )
+        # ... rest of function continues ...
 
         self.last_probe_result = "failed"
         self.toolhead.manual_move([None, None, top], 100.0)
@@ -1362,7 +1373,14 @@ class BeaconProbe:
         return [pos[0], pos[1], pos[2] + target_dist - dist]
 
     def _probing_move_to_probing_height(self, speed):
-        # ... (existing setup code) ...
+        """
+        Moves the nozzle to the 'trigger_distance' to prepare for a
+        proximity probe, accounting for backlash.
+        OPTIMIZED for Delta: Fast dive to safe height, then slow approach.
+        """
+        curtime = self.reactor.monotonic()
+        status = self.kinematics.get_status(curtime)
+        pos = self.toolhead.get_position()
         
         target_z = self.trigger_distance
         
@@ -1370,21 +1388,29 @@ class BeaconProbe:
         if self.is_delta:
              # Delta Movement Safety:
              # Ensure we never descend into unsafe delta configurations.
-             # If current Z is lower than target, raise to target first.
              self.toolhead.wait_moves() 
              
              cur_pos = self.toolhead.get_position()
+             
+             # --- FAST DESCENT LOGIC (V7) ---
+             # If we are high up (> target + 5mm + safety), dive fast first.
+             safe_approach_height = target_z + 5.0
+             if cur_pos[2] > safe_approach_height + 5.0:
+                 # Use a fast speed (e.g. 100mm/s) for the bulk of the travel
+                 approach_speed = 100.0 
+                 self.toolhead.manual_move([None, None, safe_approach_height], approach_speed)
+                 self.toolhead.wait_moves()
+             # -------------------------------
+                 
              # If we are currently LOWER than the target (e.g. near bed), move UP first.
              if cur_pos[2] < target_z:
                  self.toolhead.manual_move([None, None, target_z], speed)
                  self.toolhead.wait_moves()
                  
-             # Now perform the move to target height.
-             # If we were high up, this comes down. If we were low, we are already there.
+             # Now perform the final move to target height at probing speed.
              self.toolhead.manual_move([None, None, target_z], speed)
              self.toolhead.wait_moves()
         else:
-            # ... (Keep existing Cartesian/CoreXY logic) ...
             # Standard behavior for Cartesian/CoreXY
             pos[2] = status["axis_minimum"][2]
             try:
