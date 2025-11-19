@@ -867,51 +867,62 @@ class BeaconProbe:
 
     cmd_BEACON_POKE_help = "Test contact probe by poking the bed at current or specified XY"
     def cmd_BEACON_POKE(self, gcmd):
+        # 1. Auto-Home Check (The Fix)
+        curtime = self.reactor.monotonic()
+        kin_status = self.kinematics.get_status(curtime)
+        if "x" not in kin_status["homed_axes"] or "y" not in kin_status["homed_axes"] or "z" not in kin_status["homed_axes"]:
+             gcmd.respond_info("Printer not homed. Homing now...")
+             self.gcode.run_script_from_command("G28")
+
+        # 2. Load Parameters
         top = gcmd.get_float("TOP", self.POKE_DEFAULT_TOP)
         bottom = gcmd.get_float("BOTTOM", self.POKE_DEFAULT_BOTTOM)
         speed = gcmd.get_float("SPEED", self.POKE_DEFAULT_SPEED, maxval=self.autocal_max_speed)
-        move_speed = gcmd.get_float("MOVE_SPEED", 50.0) # Safe XY travel speed
-        fast_descend_speed = 100.0 # Speed for the initial drop
+        move_speed = gcmd.get_float("MOVE_SPEED", 50.0)
+        fast_descend_speed = 100.0 
 
-        # 1. Radius Check (Pre-Flight Safety)
+        # 3. Radius Safety Check
         target_x = gcmd.get_float("X", None)
         target_y = gcmd.get_float("Y", None)
         
+        # Determine where we are testing (Target or Current)
+        # Note: We must get position AFTER homing to be accurate
+        chk_pos = self.toolhead.get_position()
+        chk_x = target_x if target_x is not None else chk_pos[0]
+        chk_y = target_y if target_y is not None else chk_pos[1]
+
         if self.is_delta and self.print_radius:
-            # If target is provided, check it. If not, check current pos.
-            chk_x = target_x if target_x is not None else self.toolhead.get_position()[0]
-            chk_y = target_y if target_y is not None else self.toolhead.get_position()[1]
-            
             dist_sq = chk_x**2 + chk_y**2
             if dist_sq > self.print_radius**2:
                  raise gcmd.error(f"Unsafe Poke: Position ({chk_x:.2f}, {chk_y:.2f}) is outside print radius ({self.print_radius})")
 
-        # 2. Smart Positioning (The Delta Fix)
+        # 4. Smart Positioning Logic
         if target_x is not None or target_y is not None:
             gcmd.respond_info(f"Positioning toolhead to X={target_x} Y={target_y}...")
             
             cur_pos = self.toolhead.get_position()
             
-            # DELTA SAFETY: If we are high up, we MUST descend at the CENTER first.
-            # Moving X/Y at high Z violates the delta cone.
-            if self.is_delta and cur_pos[2] > top + 10.0:
-                # We assume we are homed/centered. Drop straight down to 'top' height.
-                # This gets us into the safe kinematic zone where X/Y moves are allowed.
-                self.toolhead.manual_move([None, None, top], fast_descend_speed)
+            # A. High Altitude Drop (Safe Zone)
+            # If we are high up (e.g. just homed), we must descend at the CURRENT X/Y (usually 0,0)
+            # before attempting to move out to the edge.
+            if self.is_delta and cur_pos[2] > top + 20.0:
+                # Drop straight down to safe height
+                self.toolhead.manual_move([None, None, top + 5.0], fast_descend_speed)
                 self.toolhead.wait_moves()
             
-            # Now that we are at safe Z (or if we were already low), move to Target XY
+            # B. Travel to Target
+            # Now that we are low enough to reach the edge, move to XY
             self.toolhead.manual_move([target_x, target_y, top], move_speed)
             self.toolhead.wait_moves()
 
-        # 3. The Poke Operation
+        # 5. The Poke
         pos = self.toolhead.get_position()
         gcmd.respond_info(
             f"Poke test at ({pos[0]:.3f},{pos[1]:.3f}), from {top:.3f} to {bottom:.3f}, at {speed:.3f} mm/s"
         )
 
         self.last_probe_result = "failed"
-        # Ensure we are starting at 'top' (redundant if we just moved, but safe)
+        # Ensure start height
         self.toolhead.manual_move([None, None, top], 100.0)
         self.toolhead.wait_moves()
         self.toolhead.dwell(0.5)
@@ -980,7 +991,6 @@ class BeaconProbe:
                         self.mcu_contact_probe.deactivate_gcode.run_gcode_from_command()
                         self.toolhead.manual_move([None, None, top], 100.0)
                         self.toolhead.wait_moves()
-                        # Clean up
                         self._stop_streaming()
                         self.drop_stream_latency_request(50)
 
