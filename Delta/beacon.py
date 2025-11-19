@@ -865,27 +865,40 @@ class BeaconProbe:
         )
         self.model.offset = old_offset
 
-    cmd_BEACON_POKE_help = "Test contact probe by poking the bed"
+    cmd_BEACON_POKE_help = "Test contact probe by poking the bed at current or specified XY"
     def cmd_BEACON_POKE(self, gcmd):
         top = gcmd.get_float("TOP", self.POKE_DEFAULT_TOP)
         bottom = gcmd.get_float("BOTTOM", self.POKE_DEFAULT_BOTTOM)
         speed = gcmd.get_float("SPEED", self.POKE_DEFAULT_SPEED, maxval=self.autocal_max_speed)
+        move_speed = gcmd.get_float("MOVE_SPEED", 50.0)
+
+        # 1. Handle Smart Move (New in v7 Golden)
+        target_x = gcmd.get_float("X", None)
+        target_y = gcmd.get_float("Y", None)
+        
+        if target_x is not None or target_y is not None:
+            # Move to safe Z first if we are currently too low
+            cur_z = self.toolhead.get_position()[2]
+            if cur_z < top:
+                self.toolhead.manual_move([None, None, top], move_speed)
+            
+            # Perform the XY Move
+            gcmd.respond_info(f"Positioning toolhead to X={target_x} Y={target_y}...")
+            self.toolhead.manual_move([target_x, target_y, None], move_speed)
+            self.toolhead.wait_moves()
 
         pos = self.toolhead.get_position()
         
-        # --- SAFETY: Radius Check (V7) ---
-        # Prevents MCU shutdown if user tries to poke outside physical reach
+        # 2. Safety Radius Check (Prevents Kinematic Crash)
         if self.is_delta and self.print_radius:
             dist_sq = pos[0]**2 + pos[1]**2
-            # Add a small safety margin (e.g. 1mm inside max radius)
+            # Check against print_radius
             if dist_sq > self.print_radius**2:
                  raise gcmd.error(f"Unsafe Poke: Position ({pos[0]:.2f}, {pos[1]:.2f}) is outside print radius ({self.print_radius})")
-        # ---------------------------------
 
         gcmd.respond_info(
             f"Poke test at ({pos[0]:.3f},{pos[1]:.3f}), from {top:.3f} to {bottom:.3f}, at {speed:.3f} mm/s"
         )
-        # ... rest of function continues ...
 
         self.last_probe_result = "failed"
         self.toolhead.manual_move([None, None, top], 100.0)
@@ -912,7 +925,6 @@ class BeaconProbe:
                     )
                     f.write(log_line)
 
-                # OPTIMIZATION: 50ms latency allows for better contact resolution
                 self.request_stream_latency(50)
                 self._start_streaming()
 
