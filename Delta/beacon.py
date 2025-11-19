@@ -4310,60 +4310,48 @@ class BeaconAccelHelper(adxl345.ADXL345):
 
     def _start_streaming(self):
         """
-        Start beacon (coil/proximity) streaming.
-        
-        This uses reference-counting so nested callers can request streaming
-        safely. Only perform the initial setup (reset buffers/filters and send
-        the MCU enable command) on the first start (when refcount == 0).
+        Start beacon accelerometer streaming.
         """
-        # 1. SAFETY SHIM: Do not allow streaming start if locked
-        if getattr(self, "_streaming_lock", False):
-             logging.warning("Beacon: Attempted to start streaming while locked! Ignoring.")
+        # 1. SAFETY SHIM: Do not allow streaming if the Beacon Coil is busy/locked
+        # (We check the parent beacon object for the lock)
+        if getattr(self.beacon, "_streaming_lock", False):
+             logging.warning("Beacon Accel: Attempted to start streaming while coil is locked! Ignoring.")
              return
 
-        # Ensure attribute defaults (defensive)
-        if not hasattr(self, "_stream_en"):
-            self._stream_en = 0
+        if self._stream_en == 0:
+            # Reset local buffer
+            with self._sample_lock:
+                self._raw_samples = []
+
+            # Tell the MCU to start streaming (Using the correct ACCEL command)
+            if self.accel_stream_cmd is not None:
+                try:
+                    # Send Enable=1 and the Scale ID
+                    self.accel_stream_cmd.send([1, self._scale['id']])
+                except Exception:
+                    logging.exception("Beacon: failed to enable accel_stream_cmd")
+
+        # increment refcount
+        self._stream_en += 1
+
+    def _stop_streaming(self):
+        """
+        Stop beacon accelerometer streaming.
+        """
+        if self._stream_en > 0:
+            self._stream_en -= 1
 
         if self._stream_en == 0:
-            # Reset local buffers and filters only on the first enable.
-            # FIX: Use correct variable names for BeaconProbe
-            self._stream_buffer = []
-            self._stream_buffer_count = 0
-            
-            # Reset Integrity Trackers (Optional but recommended if you added them to __init__)
-            self._last_packet_end_clock = 0
-            self._packet_integrity_errors = 0
-            
-            try:
-                self._data_filter.reset()
-            except Exception:
-                logging.exception("Beacon: _data_filter.reset() failed")
-
-            # Tell the MCU to start streaming
-            if self.beacon_stream_cmd is not None:
+            # ask MCU to stop streaming
+            if self.accel_stream_cmd is not None:
                 try:
-                    self.beacon_stream_cmd.send([1])
+                    self.accel_stream_cmd.send([0, 0])
                 except Exception:
-                    # best-effort fallback
-                    try:
-                        self.beacon_stream_cmd.send([1, 0])
-                    except Exception:
-                        logging.exception("Beacon: failed to enable beacon_stream_cmd")
-
-            # schedule the reactor timer
-            try:
-                curtime = self.reactor.monotonic()
-                self.reactor.update_timer(self._stream_timeout_timer, curtime + STREAM_TIMEOUT)
-            except Exception:
-                logging.exception("Beacon: failed to update stream timeout timer")
+                    logging.exception("Beacon: failed to disable accel_stream_cmd")
             
-            # Flush any stale data from the pipe immediately
-            self._stream_flush()
-
-        # increment refcount for nested callers
-        self._stream_en += 1
-        logging.debug("Beacon: _start_streaming -> refcount %d", self._stream_en)
+            # Clear buffer
+            with self._sample_lock:
+                self._raw_samples = []
 
     # --- APIDumpHelper callbacks ---
 
