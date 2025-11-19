@@ -1012,9 +1012,10 @@ class BeaconProbe:
         curtime = self.reactor.monotonic()
         kin_status = self.kinematics.get_status(curtime)
         
-        if "x" not in kin_status["homed_axes"] or "y" not in kin_status["homed_axes"] or "z" not in kin_status["homed_axes"]:
-             gcmd.respond_info("Printer not homed. Homing now...")
-             self.gcode.run_script_from_command("G28")
+        # FIX 1: Only check X/Y. Z is expected to be unhomed during calibration!
+        if "x" not in kin_status["homed_axes"] or "y" not in kin_status["homed_axes"]:
+             gcmd.respond_info("Printer not homed (XY). Homing now...")
+             self.gcode.run_script_from_command("G28 X Y")
         
         # 1. Move to Safe Z (2.0mm) at 100mm/s
         self.toolhead.manual_move([None, None, 2.0], 100.0)
@@ -1080,31 +1081,33 @@ class BeaconProbe:
             gcmd.respond_info(f"Contact zero found at {z_zero:.5f}")
             gcmd.respond_info("Contact phase complete. Starting Beacon scan...")
             
-            # --- FIX START ---
-            # 1. Sync the toolhead Z to the contact result (make Z relative to bed)
+            # Sync Z
             cur_pos = self.toolhead.get_position()
-            # The toolhead is currently at (z_zero + retract_dist). 
-            # We tell Klipper that physical Z is actually (current_Z - z_zero).
-            # Actually, simpler: Just reset Z to the retract height relative to 0.
             self.compat_toolhead_set_position_homing_z(self.toolhead, [cur_pos[0], cur_pos[1], retract_dist])
             
-            # 2. Move to the Calibration Start Height (cal_nozzle_z, usually 0.1mm)
-            # We must be PHYSICALLY at 0.1mm before _calibrate calls set_position(0.1)
+            # Move to Cal Start
             gcmd.respond_info(f"Moving to calibration start height: {self.cal_nozzle_z}mm")
             self.toolhead.manual_move([None, None, self.cal_nozzle_z], self.lift_speed)
             self.toolhead.wait_moves()
             
-            # 3. Start Scan (Skip manual probe)
+            # Start Scan
             self._start_calibration(gcmd, skip_manual_probe=True)
 
         finally:
             self.mcu_contact_probe.deactivate_gcode.run_gcode_from_command()
         
-        # 3. Final Home (Delta Best Practice)
-        gcmd.respond_info("Auto Calibration complete. Homing...")
-        # SAFETY: Clear Mesh before homing to avoid NaN injection from edges
+        # FIX 2: DO NOT CALL G28 HERE. It causes infinite recursion.
+        # Instead, perform a Safe Park (Move to Max Z - 10mm)
+        gcmd.respond_info("Auto Calibration complete. Parking at safe height...")
         self.gcode.run_script_from_command("BED_MESH_CLEAR")
-        self.gcode.run_script_from_command("G28")
+        
+        # Get Max Z from config/status to park safely
+        status = self.kinematics.get_status(curtime)
+        max_z = status["axis_maximum"][2]
+        park_z = max(10.0, max_z - 10.0) # Park 10mm from top
+        
+        self.toolhead.manual_move([None, None, park_z], 100.0)
+        self.toolhead.wait_moves()
         
 
     cmd_BEACON_OFFSET_COMPARE_help = "Compare contact and proximity offsets"
