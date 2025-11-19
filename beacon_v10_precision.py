@@ -65,25 +65,37 @@ class BeaconProbe:
     """
     # --- Constants ---
     CALIBRATION_POLY_DEGREE = 9
-    CALIBRATION_SAMPLE_SYNC_COUNT = 50
+    
+    # ACCURACY UPGRADE 1: Massive Oversampling
+    # Old: 50 samples for sync. New: 100 samples (smoother calibration)
+    CALIBRATION_SAMPLE_SYNC_COUNT = 100 
+    
     CALIBRATION_DWELL_TIME = 0.250
     
-    PROBE_DEFAULT_SKIP_SAMPLES = 5
-    PROBE_DEFAULT_SAMPLE_COUNT = 10
+    # ACCURACY UPGRADE 2: Static Probe Denoising
+    # Old: Skip 5, Take 10. New: Skip 20 (settle longer), Take 50 (averaging power)
+    PROBE_DEFAULT_SKIP_SAMPLES = 20
+    PROBE_DEFAULT_SAMPLE_COUNT = 50
     
-    CONTACT_PROBE_TARGET_Z = -2.0 # Target Z for contact probe moves
+    CONTACT_PROBE_TARGET_Z = -2.0 
     
     POKE_DEFAULT_TOP = 5.0
     POKE_DEFAULT_BOTTOM = -0.3
     POKE_DEFAULT_SPEED = 3.0
     
+    # ACCURACY UPGRADE 3: Auto-Calibration Precision
     AUTOCAL_DEFAULT_SPEED = 3.0
     AUTOCAL_DEFAULT_ACCEL = 100.0
     AUTOCAL_DEFAULT_RETRACT = 2.0
     AUTOCAL_DEFAULT_RETRACT_SPEED = 10.0
-    AUTOCAL_DEFAULT_SAMPLES = 3
-    AUTOCAL_DEFAULT_TOLERANCE = 0.008
-    AUTOCAL_DEFAULT_MAX_RETRIES = 3
+    
+    # Old: 3 samples. New: 10 samples (better statistical mean)
+    AUTOCAL_DEFAULT_SAMPLES = 10
+    
+    # Old: 0.008 tolerance. New: 0.004 (Force tighter repeatability)
+    AUTOCAL_DEFAULT_TOLERANCE = 0.004
+    
+    AUTOCAL_DEFAULT_MAX_RETRIES = 5 # Give it more tries to hit that perfect 0.004
     
     OFFSET_COMPARE_DEFAULT_TOP = 2.0
     
@@ -215,8 +227,12 @@ class BeaconProbe:
         self._stream_samples_queue = queue.Queue()
         self._stream_flush_event = threading.Event()
         self._log_stream = None
+        
+        # ACCURACY UPGRADE 4: Smoother Filtering
+        # Alpha 0.5 = Fast/Noisy. Alpha 0.3 = Smooth/Stable.
+        # We change the default here (user can still override in config if needed)
         self._data_filter = AlphaBetaFilter(
-            config.getfloat("filter_alpha", 0.5),
+            config.getfloat("filter_alpha", 0.3), 
             config.getfloat("filter_beta", 0.000001),
         )
         self.trapq = None
@@ -3683,7 +3699,12 @@ class BeaconMeshHelper:
                 clusters[cluster_key] = []
             clusters[cluster_key].append(distance)
 
-        with self.beacon.streaming_session(_sample_callback, latency=50):
+        # ... inside _sample_mesh ...
+        
+        # ACCURACY UPGRADE 5: High-Freq Mesh Streaming
+        # Old: 50ms latency. New: 20ms latency (finer granular data)
+        # With the v9 optimizations, the Pi can easily handle this rate.
+        with self.beacon.streaming_session(_sample_callback, latency=20):
             self.toolhead.dwell(0.25)
             self._fly_path(scan_path[1:], scan_speed, scan_runs)
 
@@ -3790,7 +3811,7 @@ class BeaconMeshHelper:
     def _generate_matrix(self, raw_clusters, mask):
         """
         Generates the final Z-value matrix from the binned cluster data.
-        OPTIMIZED (v9): Uses vectorized NumPy masking instead of loops.
+        OPTIMIZED (v9): Uses dictionary iteration and vectorized NumPy masking.
         """
         # 1. Initialize with NaNs (Fast C-fill)
         matrix = np.full((self.res_y, self.res_x), np.nan)
@@ -4358,7 +4379,7 @@ class BeaconAccelHelper(adxl345.ADXL345):
     def _process_samples(self, raw_samples, last_sample):
         """
         Processes raw accelerometer data into scaled values.
-        OPTIMIZED (v9): Uses NumPy vectorization and Zero-Copy decoding.
+        OPTIMIZED (v9): Uses NumPy vectorization for binary decoding.
         """
         (xp, xs), (yp, ys), (zp, zs) = self.config.axes_map
         scale_factor = self._scale["scale"] * GRAVITY
@@ -4378,43 +4399,35 @@ class BeaconAccelHelper(adxl345.ADXL345):
                 sample["start_clock"] + sample["delta_clock"]
             )
             
-            # PRO TRICK: Use the raw bytes directly (Zero-Copy)
-            data = sample["data"] 
+            data = sample["data"]
             
-            # PRO TRICK: Vectorized Decode (Interpret bytes as Little-Endian Int16)
-            # This replaces the slow bitwise loop with a single C-speed read
+            # Vectorized Decode
             raw_arr = np.frombuffer(data, dtype='<i2').reshape(-1, 3)
             count = raw_arr.shape[0]
             
-            # Handle Clipping (0x7FFF sentinel) efficiently
-            # We create a boolean mask instead of an if-statement per sample
+            # Handle Clipping
             clip_mask = (raw_arr == 0x7FFF)
-            
             if np.any(clip_mask):
-                # Advanced: Vectorized fix for clipped values based on previous sign
                 shifted = np.vstack([prev_raw[None, :], raw_arr[:-1]])
                 replacements = np.where(shifted >= 0, 
                                       self._clip_values[0], 
                                       self._clip_values[1])
-                # Apply fixes only where needed
                 raw_arr = np.where(clip_mask, replacements, raw_arr)
                 errors += np.sum(clip_mask)
 
             if count > 0:
                 prev_raw = raw_arr[-1]
 
-            # PRO TRICK: Vectorized Scaling
-            # Multiply entire arrays at once instead of scalar math
+            # Apply Scaling & Mapping
             x_vals = raw_arr[:, xp] * s_x
             y_vals = raw_arr[:, yp] * s_y
             z_vals = raw_arr[:, zp] * s_z
             
-            # Generate Time Steps linearly
+            # Generate Time Steps
             dt = (tend - tstart) / max(1, count - 1)
             time_vals = tstart + np.arange(count) * dt
 
-            # Combine and extend
-            # zip() is faster than a manual loop here
+            # Zip and Extend
             chunk_samples = list(zip(time_vals, x_vals, y_vals, z_vals))
             samples.extend(chunk_samples)
 
