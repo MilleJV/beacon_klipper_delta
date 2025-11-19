@@ -870,37 +870,48 @@ class BeaconProbe:
         top = gcmd.get_float("TOP", self.POKE_DEFAULT_TOP)
         bottom = gcmd.get_float("BOTTOM", self.POKE_DEFAULT_BOTTOM)
         speed = gcmd.get_float("SPEED", self.POKE_DEFAULT_SPEED, maxval=self.autocal_max_speed)
-        move_speed = gcmd.get_float("MOVE_SPEED", 50.0)
+        move_speed = gcmd.get_float("MOVE_SPEED", 50.0) # Safe XY travel speed
+        fast_descend_speed = 100.0 # Speed for the initial drop
 
-        # 1. Handle Smart Move (New in v7 Golden)
+        # 1. Radius Check (Pre-Flight Safety)
         target_x = gcmd.get_float("X", None)
         target_y = gcmd.get_float("Y", None)
         
-        if target_x is not None or target_y is not None:
-            # Move to safe Z first if we are currently too low
-            cur_z = self.toolhead.get_position()[2]
-            if cur_z < top:
-                self.toolhead.manual_move([None, None, top], move_speed)
+        if self.is_delta and self.print_radius:
+            # If target is provided, check it. If not, check current pos.
+            chk_x = target_x if target_x is not None else self.toolhead.get_position()[0]
+            chk_y = target_y if target_y is not None else self.toolhead.get_position()[1]
             
-            # Perform the XY Move
+            dist_sq = chk_x**2 + chk_y**2
+            if dist_sq > self.print_radius**2:
+                 raise gcmd.error(f"Unsafe Poke: Position ({chk_x:.2f}, {chk_y:.2f}) is outside print radius ({self.print_radius})")
+
+        # 2. Smart Positioning (The Delta Fix)
+        if target_x is not None or target_y is not None:
             gcmd.respond_info(f"Positioning toolhead to X={target_x} Y={target_y}...")
-            self.toolhead.manual_move([target_x, target_y, None], move_speed)
+            
+            cur_pos = self.toolhead.get_position()
+            
+            # DELTA SAFETY: If we are high up, we MUST descend at the CENTER first.
+            # Moving X/Y at high Z violates the delta cone.
+            if self.is_delta and cur_pos[2] > top + 10.0:
+                # We assume we are homed/centered. Drop straight down to 'top' height.
+                # This gets us into the safe kinematic zone where X/Y moves are allowed.
+                self.toolhead.manual_move([None, None, top], fast_descend_speed)
+                self.toolhead.wait_moves()
+            
+            # Now that we are at safe Z (or if we were already low), move to Target XY
+            self.toolhead.manual_move([target_x, target_y, top], move_speed)
             self.toolhead.wait_moves()
 
+        # 3. The Poke Operation
         pos = self.toolhead.get_position()
-        
-        # 2. Safety Radius Check (Prevents Kinematic Crash)
-        if self.is_delta and self.print_radius:
-            dist_sq = pos[0]**2 + pos[1]**2
-            # Check against print_radius
-            if dist_sq > self.print_radius**2:
-                 raise gcmd.error(f"Unsafe Poke: Position ({pos[0]:.2f}, {pos[1]:.2f}) is outside print radius ({self.print_radius})")
-
         gcmd.respond_info(
             f"Poke test at ({pos[0]:.3f},{pos[1]:.3f}), from {top:.3f} to {bottom:.3f}, at {speed:.3f} mm/s"
         )
 
         self.last_probe_result = "failed"
+        # Ensure we are starting at 'top' (redundant if we just moved, but safe)
         self.toolhead.manual_move([None, None, top], 100.0)
         self.toolhead.wait_moves()
         self.toolhead.dwell(0.5)
