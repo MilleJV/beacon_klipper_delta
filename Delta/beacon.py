@@ -4308,6 +4308,53 @@ class BeaconAccelHelper(adxl345.ADXL345):
 
     # --- Internal helpers ---
 
+    def _process_samples(self, raw_samples, last_sample):
+        raw = last_sample
+        (xp, xs), (yp, ys), (zp, zs) = self.config.axes_map
+        scale = self._scale["scale"] * GRAVITY
+        xs, ys, zs = xs * scale, ys * scale, zs * scale
+
+        errors = 0
+        samples = []
+
+        def process_value(low, high, last_value):
+            raw = high << 8 | low
+            if raw == 0x7FFF:
+                # Clipped value
+                return self._clip_values[0 if last_value >= 0 else 1]
+            return raw - ((high & 0x80) << 9)
+
+        for sample in raw_samples:
+            tstart = self.beacon._clock32_to_time(sample["start_clock"])
+            tend = self.beacon._clock32_to_time(
+                sample["start_clock"] + sample["delta_clock"]
+            )
+            data = bytearray(sample["data"])
+            count = int(len(data) / ACCEL_BYTES_PER_SAMPLE)
+            dt = (tend - tstart) / (count - 1)
+            for idx in range(0, count):
+                base = idx * ACCEL_BYTES_PER_SAMPLE
+                d = data[base : base + ACCEL_BYTES_PER_SAMPLE]
+                dxl, dxh, dyl, dyh, dzl, dzh = d
+                raw = (
+                    process_value(dxl, dxh, raw[0]),
+                    process_value(dyl, dyh, raw[1]),
+                    process_value(dzl, dzh, raw[2]),
+                )
+                if raw[0] is None or raw[1] is None or raw[2] is None:
+                    errors += 1
+                    samples.append(None)
+                else:
+                    samples.append(
+                        (
+                            tstart + dt * idx,
+                            raw[xp] * xs,
+                            raw[yp] * ys,
+                            raw[zp] * zs,
+                        )
+                    )
+        return (samples, errors, raw)
+    
     def _start_streaming(self):
         """
         Start beacon accelerometer streaming.
