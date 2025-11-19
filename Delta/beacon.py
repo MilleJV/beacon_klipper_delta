@@ -101,10 +101,11 @@ class BeaconProbe:
 
         # --- ONE-TIME SETUP: Detect Kinematics ---
         # Check for 'print_radius' in [printer] config to detect Delta.
-        # We store this in 'self' so all commands can check it safely later.
         printer_config = config.getsection("printer")
-        print_radius = printer_config.getfloat("print_radius", None, above=0.0)
-        self.is_delta = print_radius is not None
+        
+        # FIX: Assign to self.print_radius so other functions can access it
+        self.print_radius = printer_config.getfloat("print_radius", None, above=0.0)
+        self.is_delta = self.print_radius is not None
         # -----------------------------------------
 
         self.speed = config.getfloat("speed", 5.0, above=0.0)
@@ -1012,7 +1013,7 @@ class BeaconProbe:
         curtime = self.reactor.monotonic()
         kin_status = self.kinematics.get_status(curtime)
         
-        # FIX 1: Only check X/Y. Z is expected to be unhomed during calibration!
+        # FIX: Only check X/Y. Z is expected to be unhomed during calibration!
         if "x" not in kin_status["homed_axes"] or "y" not in kin_status["homed_axes"]:
              gcmd.respond_info("Printer not homed (XY). Homing now...")
              self.gcode.run_script_from_command("G28 X Y")
@@ -1096,8 +1097,7 @@ class BeaconProbe:
         finally:
             self.mcu_contact_probe.deactivate_gcode.run_gcode_from_command()
         
-        # FIX 2: DO NOT CALL G28 HERE. It causes infinite recursion.
-        # Instead, perform a Safe Park (Move to Max Z - 10mm)
+        # FIX 2: Safe Park (Move to Max Z - 10mm) - NO G28 CALL
         gcmd.respond_info("Auto Calibration complete. Parking at safe height...")
         self.gcode.run_script_from_command("BED_MESH_CLEAR")
         
