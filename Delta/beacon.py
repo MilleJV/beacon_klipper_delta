@@ -650,22 +650,17 @@ class BeaconProbe:
     def cmd_BEACON_CALIBRATE(self, gcmd):
         self._start_calibration(gcmd)
 
-    cmd_BEACON_ESTIMATE_BACKLASH_help = "Estimate Z axis backlash"
     def cmd_BEACON_ESTIMATE_BACKLASH(self, gcmd):
-        # FIX: Set Overrun to 0.5 and Z to 1.5 so (1.5 - 0.5 = 1.0) > 0.5 safety limit
         overrun = gcmd.get_float("OVERRUN", 0.5)
         target_z_dist = gcmd.get_float("Z", 1.5)
+        speed = gcmd.get_float("SPEED", 100.0) # Fast approach
+        creep_speed = gcmd.get_float("CREEP", 20.0) # Slow approach
         
         num_samples = gcmd.get_int("SAMPLES", 20)
         sample_count_per_read = 50
         settle_time = self.z_settling_time
-        
-        approach_buffer = 0.5
-        creep_speed = 3.0
         dwell_time = 0.1
-        backlash_clearance = 2.0
         
-        fast_speed = 100.0
         cycle_speed = 30.0
 
         if target_z_dist - overrun < 0.5:
@@ -677,19 +672,15 @@ class BeaconProbe:
         gcmd.respond_info("Homing...")
         self.gcode.run_script_from_command("G28")
         
-        # 2. Move to Safe Z
-        self.toolhead.manual_move([None, None, 10.0], fast_speed)
-        self.toolhead.wait_moves()
-        
-        # 3. Move to Z_Start_test
+        # 2. Move to Safe Z (Fast)
         start_pos_z = target_z_dist + overrun
-        gcmd.respond_info(f"Moving to start position Z={start_pos_z:.3f}")
-        self.toolhead.manual_move([None, None, start_pos_z], cycle_speed)
+        gcmd.respond_info(f"Moving to start position Z={start_pos_z:.3f} at {speed}mm/s")
+        self.toolhead.manual_move([None, None, start_pos_z], speed)
         self.toolhead.wait_moves()
 
-        # 4. Baseline Measure
-        gcmd.respond_info("Taking baseline measurement...")
-        self.toolhead.manual_move([None, None, target_z_dist], 1.0) 
+        # 3. Slower move from safety offset site to testing site
+        gcmd.respond_info(f"Approaching target Z={target_z_dist:.3f} at {creep_speed}mm/s")
+        self.toolhead.manual_move([None, None, target_z_dist], creep_speed)
         self.toolhead.wait_moves()
         self.toolhead.dwell(1.0)
         
@@ -700,7 +691,7 @@ class BeaconProbe:
         samples_down = []
         samples_up = []
 
-        # 5. Test Loop
+        # 4. Test Loop
         self.request_stream_latency(50)
         self._start_streaming()
         
@@ -709,7 +700,6 @@ class BeaconProbe:
                 # --- DOWN SAMPLE ---
                 up_pos = target_kin_z + overrun
                 self.toolhead.manual_move([None, None, up_pos], cycle_speed)
-                
                 self.toolhead.manual_move([None, None, target_kin_z], creep_speed)
                 self.toolhead.wait_moves()
                 self.toolhead.dwell(dwell_time)
@@ -721,7 +711,6 @@ class BeaconProbe:
                 low_pos = target_kin_z - overrun
                 if low_pos < 0.1: low_pos = 0.1
                 self.toolhead.manual_move([None, None, low_pos], cycle_speed)
-                
                 self.toolhead.manual_move([None, None, target_kin_z], creep_speed)
                 self.toolhead.wait_moves()
                 self.toolhead.dwell(dwell_time)
@@ -738,8 +727,9 @@ class BeaconProbe:
             self._stop_streaming()
             self.drop_stream_latency_request(50)
 
-        # 6. Finish
-        self.toolhead.manual_move([None, None, 2.0], fast_speed)
+        # 5. Finish Safe
+        self.toolhead.manual_move([None, None, 5.0], speed)
+        self.gcode.run_script_from_command("BED_MESH_CLEAR") # Prevent NaN crash
         self.gcode.run_script_from_command("G28")
 
         # Stats
@@ -1067,7 +1057,10 @@ class BeaconProbe:
         
         # 3. Final Home (Delta Best Practice)
         gcmd.respond_info("Auto Calibration complete. Homing...")
+        # SAFETY: Clear Mesh before homing to avoid NaN injection from edges
+        self.gcode.run_script_from_command("BED_MESH_CLEAR")
         self.gcode.run_script_from_command("G28")
+        
 
     cmd_BEACON_OFFSET_COMPARE_help = "Compare contact and proximity offsets"
     def cmd_BEACON_OFFSET_COMPARE(self, gcmd):
@@ -1368,13 +1361,7 @@ class BeaconProbe:
         return [pos[0], pos[1], pos[2] + target_dist - dist]
 
     def _probing_move_to_probing_height(self, speed):
-        """
-        Performs a move towards Z-min to prepare for probing.
-        Uses manual_move for Deltas to avoid homing/timeout issues.
-        """
-        curtime = self.reactor.monotonic()
-        status = self.kinematics.get_status(curtime)
-        pos = self.toolhead.get_position()
+        # ... (existing setup code) ...
         
         target_z = self.trigger_distance
         
@@ -1383,15 +1370,20 @@ class BeaconProbe:
              # Delta Movement Safety:
              # Ensure we never descend into unsafe delta configurations.
              # If current Z is lower than target, raise to target first.
+             self.toolhead.wait_moves() 
+             
              cur_pos = self.toolhead.get_position()
+             # If we are currently LOWER than the target (e.g. near bed), move UP first.
              if cur_pos[2] < target_z:
                  self.toolhead.manual_move([None, None, target_z], speed)
                  self.toolhead.wait_moves()
                  
-             # Move to target Z (handles descent if above, or ensures position if raised)
+             # Now perform the move to target height.
+             # If we were high up, this comes down. If we were low, we are already there.
              self.toolhead.manual_move([None, None, target_z], speed)
              self.toolhead.wait_moves()
         else:
+            # ... (Keep existing Cartesian/CoreXY logic) ...
             # Standard behavior for Cartesian/CoreXY
             pos[2] = status["axis_minimum"][2]
             try:
@@ -3427,6 +3419,11 @@ class BeaconMeshHelper:
         # Process data and apply mesh
         z_matrix = self._process_clusters(raw_clusters, gcmd)
         self._apply_mesh(z_matrix, gcmd)
+
+        # Final Home with Safety Clear
+        gcmd.respond_info("Mesh calibration complete. Clearing mesh and Homing...")
+        self.gcode.run_script_from_command("BED_MESH_CLEAR")
+        self.gcode.run_script_from_command("G28")
 
         # Final Home (Delta Best Practice)
         gcmd.respond_info("Mesh calibration complete. Homing...")
