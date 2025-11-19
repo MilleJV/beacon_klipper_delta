@@ -3790,50 +3790,28 @@ class BeaconMeshHelper:
     def _generate_matrix(self, raw_clusters, mask):
         """
         Generates the final Z-value matrix from the binned cluster data.
+        OPTIMIZED: Uses dictionary iteration and vectorized NumPy masking.
         """
-        TOLERANCE = 1e-5 # Float tolerance for boundary checks
-
-        faulty_indexes = []
-        
-        # 1. Initialize the entire matrix with np.nan (Not a Number)
-        #    This is our "unprobed" or "missing" marker.
+        # 1. Initialize with NaNs
         matrix = np.full((self.res_y, self.res_x), np.nan)
-        
-        # 2. Iterate over the full rectangular grid
-        for y_index in range(self.res_y):
-            for x_index in range(self.res_x):
-                
-                x_coord = x_index * self.step_x + self.min_x
-                y_coord = y_index * self.step_y + self.min_y
-                
-                # --- DELTA / ROUND BED MASKING ---
-                if self.radius is not None:
-                    dist_sq = x_coord**2 + y_coord**2
-                    
-                    # If point is outside the circle, mark it as NaN and skip.
-                    # This NaN will be ignored by _check_matrix and
-                    # will make the web UI graph look correct.
-                    if dist_sq > (self.radius**2 + TOLERANCE):
-                        matrix[(y_index, x_index)] = np.nan
-                        continue
-                # --- END DELTA CHECK ---
+        faulty_indexes = []
 
-                # 3. Process collected data
-                cluster_key = (x_index, y_index)
-                cluster_values = raw_clusters.get(cluster_key, None)
-                
-                if cluster_values is not None and len(cluster_values) > 0:
-                    # Point is *inside* the circle and has data.
-                    if mask is None or mask[(y_index, x_index)]:
-                        # Valid data: calculate the median Z deviation
-                        matrix[(y_index, x_index)] = self.beacon.trigger_distance - median(cluster_values)
-                    else:
-                        # Point is in a faulty region, mark for interpolation
-                        matrix[(y_index, x_index)] = np.nan
-                        faulty_indexes.append((y_index, x_index))
-                
-                # If a point is *inside* the circle but has NO data
-                # (e.g., our [15,0] bug), it remains np.nan.
+        # 2. Fill from Clusters (Iterate only captured data)
+        for (x_ind, y_ind), cluster_values in raw_clusters.items():
+            if 0 <= x_ind < self.res_x and 0 <= y_ind < self.res_y:
+                if mask is None or mask[y_ind, x_ind]:
+                     if cluster_values:
+                        matrix[y_ind, x_ind] = self.beacon.trigger_distance - median(cluster_values)
+                else:
+                     faulty_indexes.append((y_ind, x_ind))
+
+        # 3. Apply Radius Mask (Vectorized)
+        if self.radius is not None:
+            y_coords = np.linspace(self.min_y, self.max_y, self.res_y)
+            x_coords = np.linspace(self.min_x, self.max_x, self.res_x)
+            xv, yv = np.meshgrid(x_coords, y_coords)
+            dist_sq = xv**2 + yv**2
+            matrix[dist_sq > (self.radius**2 + 1e-5)] = np.nan
 
         return matrix, faulty_indexes
 
@@ -4373,51 +4351,61 @@ class BeaconAccelHelper(adxl345.ADXL345):
     # --- Internal helpers ---
 
     def _process_samples(self, raw_samples, last_sample):
-        raw = last_sample
+        """
+        Processes raw accelerometer data into scaled values.
+        OPTIMIZED: Uses NumPy vectorization for binary decoding.
+        """
         (xp, xs), (yp, ys), (zp, zs) = self.config.axes_map
-        scale = self._scale["scale"] * GRAVITY
-        xs, ys, zs = xs * scale, ys * scale, zs * scale
+        scale_factor = self._scale["scale"] * GRAVITY
+        s_x = xs * scale_factor
+        s_y = ys * scale_factor
+        s_z = zs * scale_factor
 
         errors = 0
         samples = []
-
-        def process_value(low, high, last_value):
-            raw = high << 8 | low
-            if raw == 0x7FFF:
-                # Clipped value
-                return self._clip_values[0 if last_value >= 0 else 1]
-            return raw - ((high & 0x80) << 9)
+        
+        # Get persistent raw state for clipping logic
+        prev_raw = np.array(last_sample, dtype=np.int16)
 
         for sample in raw_samples:
             tstart = self.beacon._clock32_to_time(sample["start_clock"])
             tend = self.beacon._clock32_to_time(
                 sample["start_clock"] + sample["delta_clock"]
             )
-            data = bytearray(sample["data"])
-            count = int(len(data) / ACCEL_BYTES_PER_SAMPLE)
-            dt = (tend - tstart) / (count - 1)
-            for idx in range(0, count):
-                base = idx * ACCEL_BYTES_PER_SAMPLE
-                d = data[base : base + ACCEL_BYTES_PER_SAMPLE]
-                dxl, dxh, dyl, dyh, dzl, dzh = d
-                raw = (
-                    process_value(dxl, dxh, raw[0]),
-                    process_value(dyl, dyh, raw[1]),
-                    process_value(dzl, dzh, raw[2]),
-                )
-                if raw[0] is None or raw[1] is None or raw[2] is None:
-                    errors += 1
-                    samples.append(None)
-                else:
-                    samples.append(
-                        (
-                            tstart + dt * idx,
-                            raw[xp] * xs,
-                            raw[yp] * ys,
-                            raw[zp] * zs,
-                        )
-                    )
-        return (samples, errors, raw)
+            
+            data = sample["data"]
+            
+            # Vectorized Decode
+            raw_arr = np.frombuffer(data, dtype='<i2').reshape(-1, 3)
+            count = raw_arr.shape[0]
+            
+            # Handle Clipping
+            clip_mask = (raw_arr == 0x7FFF)
+            if np.any(clip_mask):
+                shifted = np.vstack([prev_raw[None, :], raw_arr[:-1]])
+                replacements = np.where(shifted >= 0, 
+                                      self._clip_values[0], 
+                                      self._clip_values[1])
+                raw_arr = np.where(clip_mask, replacements, raw_arr)
+                errors += np.sum(clip_mask)
+
+            if count > 0:
+                prev_raw = raw_arr[-1]
+
+            # Apply Scaling & Mapping
+            x_vals = raw_arr[:, xp] * s_x
+            y_vals = raw_arr[:, yp] * s_y
+            z_vals = raw_arr[:, zp] * s_z
+            
+            # Generate Time Steps
+            dt = (tend - tstart) / max(1, count - 1)
+            time_vals = tstart + np.arange(count) * dt
+
+            # Zip and Extend
+            chunk_samples = list(zip(time_vals, x_vals, y_vals, z_vals))
+            samples.extend(chunk_samples)
+
+        return (samples, errors, tuple(prev_raw))
     
     def _start_streaming(self):
         """
