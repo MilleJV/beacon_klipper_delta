@@ -962,7 +962,6 @@ class BeaconProbe:
         except OSError as e:
             gcmd.respond_info(f"Warning: Could not write poke data to {filename}: {e}")
 
-    cmd_BEACON_AUTO_CALIBRATE_help = "Automatically calibrates the Beacon probe"
     def cmd_BEACON_AUTO_CALIBRATE(self, gcmd):
         speed = gcmd.get_float("SPEED", self.autocal_speed, above=0, maxval=self.autocal_max_speed)
         desired_accel = gcmd.get_float("ACCEL", self.autocal_accel, minval=1)
@@ -1045,21 +1044,29 @@ class BeaconProbe:
             gcmd.respond_info(f"Contact zero found at {z_zero:.5f}")
             gcmd.respond_info("Contact phase complete. Starting Beacon scan...")
             
-            # Move UP to 5mm for scan
-            self.toolhead.manual_move([None, None, 5.0], self.lift_speed)
+            # --- FIX START ---
+            # 1. Sync the toolhead Z to the contact result (make Z relative to bed)
+            cur_pos = self.toolhead.get_position()
+            # The toolhead is currently at (z_zero + retract_dist). 
+            # We tell Klipper that physical Z is actually (current_Z - z_zero).
+            # Actually, simpler: Just reset Z to the retract height relative to 0.
+            self.compat_toolhead_set_position_homing_z(self.toolhead, [cur_pos[0], cur_pos[1], retract_dist])
+            
+            # 2. Move to the Calibration Start Height (cal_nozzle_z, usually 0.1mm)
+            # We must be PHYSICALLY at 0.1mm before _calibrate calls set_position(0.1)
+            gcmd.respond_info(f"Moving to calibration start height: {self.cal_nozzle_z}mm")
+            self.toolhead.manual_move([None, None, self.cal_nozzle_z], self.lift_speed)
             self.toolhead.wait_moves()
             
-            # FIX: Use implicit homing wrapper
-            cur_pos = self.toolhead.get_position()
-            self.compat_toolhead_set_position_homing_z(self.toolhead, [cur_pos[0], cur_pos[1], 5.0 - z_zero])
-            
-            # Start Scan (Skip manual probe)
+            # 3. Start Scan (Skip manual probe)
+            # _calibrate will now assert set_position(0.1), which matches our physical reality.
             self._start_calibration(gcmd, skip_manual_probe=True)
+            # --- FIX END ---
 
         finally:
             self.mcu_contact_probe.deactivate_gcode.run_gcode_from_command()
         
-        # 3. Final Park (No G28 needed as Z is now homed by compat wrapper)
+        # 3. Final Park
         gcmd.respond_info("Auto Calibration complete. Parking...")
         self.toolhead.manual_move([None, None, 10.0], 30.0)
         self.toolhead.manual_move([0.0, 0.0, None], 30.0)
