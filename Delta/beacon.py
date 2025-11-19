@@ -1060,18 +1060,14 @@ class BeaconProbe:
             self.toolhead.wait_moves()
             
             # 3. Start Scan (Skip manual probe)
-            # _calibrate will now assert set_position(0.1), which matches our physical reality.
             self._start_calibration(gcmd, skip_manual_probe=True)
-            # --- FIX END ---
 
         finally:
             self.mcu_contact_probe.deactivate_gcode.run_gcode_from_command()
         
-        # 3. Final Park
-        gcmd.respond_info("Auto Calibration complete. Parking...")
-        self.toolhead.manual_move([None, None, 10.0], 30.0)
-        self.toolhead.manual_move([0.0, 0.0, None], 30.0)
-        self.toolhead.wait_moves()
+        # 3. Final Home (Delta Best Practice)
+        gcmd.respond_info("Auto Calibration complete. Homing...")
+        self.gcode.run_script_from_command("G28")
 
     cmd_BEACON_OFFSET_COMPARE_help = "Compare contact and proximity offsets"
     def cmd_BEACON_OFFSET_COMPARE(self, gcmd):
@@ -3432,6 +3428,10 @@ class BeaconMeshHelper:
         z_matrix = self._process_clusters(raw_clusters, gcmd)
         self._apply_mesh(z_matrix, gcmd)
 
+        # Final Home (Delta Best Practice)
+        gcmd.respond_info("Mesh calibration complete. Homing...")
+        self.gcode.run_script_from_command("G28")
+        
     # --- 3. Path Generation ---
 
     def _generate_path(self):
