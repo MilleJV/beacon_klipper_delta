@@ -3790,13 +3790,14 @@ class BeaconMeshHelper:
     def _generate_matrix(self, raw_clusters, mask):
         """
         Generates the final Z-value matrix from the binned cluster data.
-        OPTIMIZED: Uses dictionary iteration and vectorized NumPy masking.
+        OPTIMIZED (v9): Uses vectorized NumPy masking instead of loops.
         """
-        # 1. Initialize with NaNs
+        # 1. Initialize with NaNs (Fast C-fill)
         matrix = np.full((self.res_y, self.res_x), np.nan)
         faulty_indexes = []
 
-        # 2. Fill from Clusters (Iterate only captured data)
+        # 2. Sparse Iteration
+        # Only loop through points we actually touched, not the whole grid.
         for (x_ind, y_ind), cluster_values in raw_clusters.items():
             if 0 <= x_ind < self.res_x and 0 <= y_ind < self.res_y:
                 if mask is None or mask[y_ind, x_ind]:
@@ -3805,12 +3806,16 @@ class BeaconMeshHelper:
                 else:
                      faulty_indexes.append((y_ind, x_ind))
 
-        # 3. Apply Radius Mask (Vectorized)
+        # 3. Vectorized Radius Masking
+        # Calculates geometry for 1000+ points in one operation
         if self.radius is not None:
             y_coords = np.linspace(self.min_y, self.max_y, self.res_y)
             x_coords = np.linspace(self.min_x, self.max_x, self.res_x)
             xv, yv = np.meshgrid(x_coords, y_coords)
+            
             dist_sq = xv**2 + yv**2
+            
+            # Apply mask in one go
             matrix[dist_sq > (self.radius**2 + 1e-5)] = np.nan
 
         return matrix, faulty_indexes
@@ -4353,7 +4358,7 @@ class BeaconAccelHelper(adxl345.ADXL345):
     def _process_samples(self, raw_samples, last_sample):
         """
         Processes raw accelerometer data into scaled values.
-        OPTIMIZED: Uses NumPy vectorization for binary decoding.
+        OPTIMIZED (v9): Uses NumPy vectorization and Zero-Copy decoding.
         """
         (xp, xs), (yp, ys), (zp, zs) = self.config.axes_map
         scale_factor = self._scale["scale"] * GRAVITY
@@ -4373,35 +4378,43 @@ class BeaconAccelHelper(adxl345.ADXL345):
                 sample["start_clock"] + sample["delta_clock"]
             )
             
-            data = sample["data"]
+            # PRO TRICK: Use the raw bytes directly (Zero-Copy)
+            data = sample["data"] 
             
-            # Vectorized Decode
+            # PRO TRICK: Vectorized Decode (Interpret bytes as Little-Endian Int16)
+            # This replaces the slow bitwise loop with a single C-speed read
             raw_arr = np.frombuffer(data, dtype='<i2').reshape(-1, 3)
             count = raw_arr.shape[0]
             
-            # Handle Clipping
+            # Handle Clipping (0x7FFF sentinel) efficiently
+            # We create a boolean mask instead of an if-statement per sample
             clip_mask = (raw_arr == 0x7FFF)
+            
             if np.any(clip_mask):
+                # Advanced: Vectorized fix for clipped values based on previous sign
                 shifted = np.vstack([prev_raw[None, :], raw_arr[:-1]])
                 replacements = np.where(shifted >= 0, 
                                       self._clip_values[0], 
                                       self._clip_values[1])
+                # Apply fixes only where needed
                 raw_arr = np.where(clip_mask, replacements, raw_arr)
                 errors += np.sum(clip_mask)
 
             if count > 0:
                 prev_raw = raw_arr[-1]
 
-            # Apply Scaling & Mapping
+            # PRO TRICK: Vectorized Scaling
+            # Multiply entire arrays at once instead of scalar math
             x_vals = raw_arr[:, xp] * s_x
             y_vals = raw_arr[:, yp] * s_y
             z_vals = raw_arr[:, zp] * s_z
             
-            # Generate Time Steps
+            # Generate Time Steps linearly
             dt = (tend - tstart) / max(1, count - 1)
             time_vals = tstart + np.arange(count) * dt
 
-            # Zip and Extend
+            # Combine and extend
+            # zip() is faster than a manual loop here
             chunk_samples = list(zip(time_vals, x_vals, y_vals, z_vals))
             samples.extend(chunk_samples)
 
