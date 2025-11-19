@@ -650,6 +650,7 @@ class BeaconProbe:
     def cmd_BEACON_CALIBRATE(self, gcmd):
         self._start_calibration(gcmd)
 
+    cmd_BEACON_ESTIMATE_BACKLASH_help = "Estimate Z axis backlash"
     def cmd_BEACON_ESTIMATE_BACKLASH(self, gcmd):
         overrun = gcmd.get_float("OVERRUN", 0.5)
         target_z_dist = gcmd.get_float("Z", 1.5)
