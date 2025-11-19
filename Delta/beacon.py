@@ -99,14 +99,25 @@ class BeaconProbe:
         self.name = config.get_name()
         self.gcode = printer.lookup_object("gcode")
 
-        # --- ONE-TIME SETUP: Detect Kinematics ---
-        # Check for 'print_radius' in [printer] config to detect Delta.
+        # --- KINEMATICS DETECTION & SAFETY SETUP (V9 Standard) ---
+        # Robustly detect Delta kinematics by checking the printer config directly.
+        # This works even if 'print_radius' is missing (falls back to 'delta_radius').
         printer_config = config.getsection("printer")
+        kinematics = printer_config.get("kinematics", "none")
+        self.is_delta = kinematics == "delta"
         
-        # FIX: Assign to self.print_radius so other functions can access it
-        self.print_radius = printer_config.getfloat("print_radius", None, above=0.0)
-        self.is_delta = self.print_radius is not None
-        # -----------------------------------------
+        self.print_radius = None
+        if self.is_delta:
+            # Try print_radius first (user override), then fallback to delta_radius (physical limit)
+            self.print_radius = printer_config.getfloat("print_radius", None, above=0.0)
+            if self.print_radius is None:
+                self.print_radius = printer_config.getfloat("delta_radius", None, above=0.0)
+            
+            if self.print_radius:
+                logging.info(f"Beacon: Delta kinematics detected. Safety radius set to {self.print_radius:.2f}mm")
+            else:
+                logging.warning("Beacon: Delta kinematics detected but no radius found! Safety checks disabled.")
+        # ---------------------------------------------------------
 
         self.speed = config.getfloat("speed", 5.0, above=0.0)
         self.lift_speed = config.getfloat("lift_speed", self.speed, above=0.0)
@@ -144,7 +155,6 @@ class BeaconProbe:
         self.contact_latency_min = config.getint("contact_latency_min", 0)
         self.contact_sensitivity = config.getint("contact_sensitivity", 0)
         
-        # NEW: Configurable samples for offset compare (Default 2 as requested)
         self.offset_compare_samples = config.getint("offset_compare_samples", 2, minval=1)
 
         self.skip_firmware_version_check = config.getboolean(
@@ -153,19 +163,13 @@ class BeaconProbe:
         
         self.hardware_failure = None
         
-        # NEW: Safety Shim & Integrity State
-        self._streaming_lock = False  # Prevents starting stream during critical ops
-        self._last_packet_end_clock = 0
-        self._packet_integrity_errors = 0
-
-        # NEW: Safety Shim & Integrity State
+        # Safety Shim & Integrity State
         self._streaming_lock = False 
         self._last_packet_end_clock = 0
         self._packet_integrity_errors = 0
         
         # Load helper modules
         self.mesh_helper = BeaconMeshHelper.create(self, config)
-        # ...
 
         # Load models
         self.model = None
@@ -195,8 +199,6 @@ class BeaconProbe:
         self.last_contact_msg = None
         self.hardware_failure = None
 
-        # Load helper modules
-        self.mesh_helper = BeaconMeshHelper.create(self, config)
         self.homing_helper = BeaconHomingHelper.create(self, config)
         self.accel_helper = None
         self.accel_config = BeaconAccelConfig(config)
